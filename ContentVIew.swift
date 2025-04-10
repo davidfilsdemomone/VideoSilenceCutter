@@ -8,14 +8,15 @@ struct WindowAccessor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         DispatchQueue.main.async {
             if let window = NSApplication.shared.windows.first {
-                window.styleMask = window.styleMask.subtracting(.resizable)
+                window.styleMask.remove(.resizable)
                 window.minSize = NSSize(width: 1000, height: 900)
                 window.maxSize = NSSize(width: 1000, height: 900)
             }
         }
         return NSView()
     }
-    func updateNSView(_ nsView: NSView, context: Context) { }
+    
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 extension View {
@@ -39,26 +40,30 @@ struct PlayerView: NSViewRepresentable {
 }
 
 // MARK: - Vue de prévisualisation (Sheet)
+// Utilisation d'un DispatchSourceTimer haute fréquence pour tenter une actualisation toutes les 1 ms (logique)
 struct PreviewSheetView: View {
     let player: AVPlayer
     let segments: [CMTimeRange]
     let dismiss: () -> Void
-    @State private var timeObserverToken: Any?
+    
+    @State private var highResTimer: DispatchSourceTimer?
     
     var body: some View {
         ZStack {
             Color.black.opacity(0.4)
                 .edgesIgnoringSafeArea(.all)
-                .onTapGesture { dismiss() }
+                .onTapGesture { cleanupAndDismiss() }
+            
             PlayerView(player: player)
                 .frame(width: 800, height: 450)
                 .cornerRadius(10)
                 .shadow(radius: 10)
                 .onTapGesture { }
+            
             VStack {
                 HStack {
                     Spacer()
-                    Button(action: { dismiss() }) {
+                    Button(action: { cleanupAndDismiss() }) {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.white)
                             .font(.largeTitle)
@@ -72,32 +77,30 @@ struct PreviewSheetView: View {
         .onAppear {
             player.automaticallyWaitsToMinimizeStalling = false
             player.play()
-            addTimeObserver()
+            setupHighResTimer()
         }
         .onDisappear {
-            if let token = timeObserverToken {
-                player.removeTimeObserver(token)
-                timeObserverToken = nil
-            }
+            highResTimer?.cancel()
+            highResTimer = nil
         }
     }
     
-    func addTimeObserver() {
-        // Actualisation toutes les 0.1 s pour la prévisualisation
-        let interval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-        timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { currentTime in
+    // Mise en place d'un timer DispatchSource déclenché toutes les 1 ms
+    func setupHighResTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(1), leeway: .milliseconds(0))
+        timer.setEventHandler { [self] in
+            let currentTime = player.currentTime()
             guard let lastSegment = segments.last else { return }
-            let tolerance = CMTime(seconds: 0.1, preferredTimescale: lastSegment.end.timescale)
+            let tolerance = CMTime(seconds: 0.001, preferredTimescale: lastSegment.end.timescale)
             let endMinusTolerance = lastSegment.end - tolerance
             
-            // Si on arrive à la fin du dernier segment
+            // Si le temps courant atteint ou dépasse la fin du dernier segment (avec tolérance), on ferme la prévisualisation.
             if currentTime >= lastSegment.start && currentTime >= endMinusTolerance {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    dismiss()
-                }
+                cleanupAndDismiss()
                 return
             }
-            // Sauter automatiquement s'il n'est pas dans un segment
+            // Si le temps courant n'appartient pas à un segment, on saute vers le prochain segment.
             if !segments.contains(where: { $0.start <= currentTime && currentTime < $0.end }) {
                 if let nextSegment = segments.first(where: { $0.start > currentTime }) {
                     player.seek(to: nextSegment.start, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
@@ -106,6 +109,14 @@ struct PreviewSheetView: View {
                 }
             }
         }
+        highResTimer = timer
+        timer.resume()
+    }
+    
+    func cleanupAndDismiss() {
+        highResTimer?.cancel()
+        highResTimer = nil
+        dismiss()
     }
 }
 
@@ -126,11 +137,9 @@ func loadAudioSamples(from asset: AVAsset,
         progressUpdate("Impossible d'obtenir le Stream Basic Description.")
         return nil
     }
-    
     let sampleRate = asbd.mSampleRate
     let channels = asbd.mChannelsPerFrame
-    // Pour obtenir 1 ms de précision dans la création des segments
-    let timeScale: CMTimeScale = 1000
+    let timeScale: CMTimeScale = 1000  // 1 ms de précision
     let expectedDuration = asset.duration.seconds
     
     guard let reader = try? AVAssetReader(asset: asset) else {
@@ -172,12 +181,10 @@ func loadAudioSamples(from asset: AVAsset,
                 
                 let progress = min(Double(currentSampleCount) / Double(totalSamplesEstimated) * 100, 100)
                 let elapsed = Date().timeIntervalSince(startTimeLocal)
-                let averageTimePerSample = (Double(currentSampleCount) > 0) ? elapsed / Double(currentSampleCount) : 0
+                let averageTimePerSample = (currentSampleCount > 0) ? elapsed / Double(currentSampleCount) : 0
                 let samplesLeft = Double(totalSamplesEstimated - currentSampleCount)
                 let remainingTime = max(samplesLeft * averageTimePerSample, 0)
-                
-                progressUpdate(String(format: "Chargement audio : %.1f%%, temps restant ≈ %.1f s",
-                                      progress, remainingTime))
+                progressUpdate(String(format: "Chargement audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
             }
         }
     }
@@ -190,10 +197,6 @@ func loadAudioSamples(from asset: AVAsset,
 }
 
 // MARK: - Détection des segments non silencieux avec précision 1 ms
-// L'algorithme ci‑dessous utilise des pas de 1 ms (en nombre de frames)
-// pour calculer le RMS sur de petites fenêtres et détecter le silence.
-// Seul un silence dont la durée est supérieure ou égale à "minSilenceDuration"
-// (exprimée en secondes, par exemple 0.5 s) est considéré comme silence.
 func computeMaxRMS(samples: [Float],
                    sampleRate: Double,
                    channels: UInt32) -> Float {
@@ -219,37 +222,31 @@ func computeMaxRMS(samples: [Float],
 }
 
 func detectNonSilentSegmentsFromSamples(samples: [Float],
-                                          sampleRate: Double,
-                                          channels: UInt32,
-                                          // Seuil exprimé en pourcentage par rapport au maximum RMS
-                                          thresholdPercentage: Float,
-                                          // Durée minimale de silence (en secondes) pour être considérée comme silence
-                                          minSilenceDuration: Double,
-                                          progressUpdate: @escaping (String) -> Void)
+                                        sampleRate: Double,
+                                        channels: UInt32,
+                                        thresholdPercentage: Float,
+                                        minSilenceDuration: Double,
+                                        progressUpdate: @escaping (String) -> Void)
 -> [CMTimeRange] {
     let totalFrames = samples.count / Int(channels)
-    // Utilisation d'un pas fixe correspondant à environ 1 ms d'audio
     let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
-    let timePerFrame = 1.0 / sampleRate
-    let timeScale: CMTimeScale = 1000  // Précision de 1 ms pour les CMTime
-
-    // Calcul du maximum de RMS sur des fenêtres de 1 ms
+    let timeScale: CMTimeScale = 1000  // Précision 1 ms
+    
     let maxRMS = computeMaxRMS(samples: samples, sampleRate: sampleRate, channels: channels)
     let silenceThreshold = (thresholdPercentage / 100.0) * maxRMS
     
     var silenceIntervals = [(startFrame: Int, endFrame: Int)]()
     var inSilence = false
     var silenceStartFrame = 0
-    
     let startTimeLocal = Date()
     var frameIndex = 0
+    
     while frameIndex < totalFrames {
-        // Mise à jour périodique de la progression
         let progress = Double(frameIndex) / Double(totalFrames) * 100
         let elapsed = Date().timeIntervalSince(startTimeLocal)
-        let averageTimePerFrame = (frameIndex > 0) ? elapsed / Double(frameIndex) : 0
+        let avgTimePerFrame = frameIndex > 0 ? elapsed / Double(frameIndex) : 0
         let framesLeft = Double(totalFrames - frameIndex)
-        let remainingTime = framesLeft * averageTimePerFrame
+        let remainingTime = framesLeft * avgTimePerFrame
         DispatchQueue.main.async {
             progressUpdate(String(format: "Analyse audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
         }
@@ -267,13 +264,11 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
         
         if rms < silenceThreshold {
             if !inSilence {
-                // Début d'un silence
                 inSilence = true
                 silenceStartFrame = frameIndex
             }
         } else {
             if inSilence {
-                // Fin du silence détecté ; on vérifie sa durée
                 let silenceFrames = frameIndex - silenceStartFrame
                 let silenceDuration = Double(silenceFrames) / sampleRate
                 if silenceDuration >= minSilenceDuration {
@@ -284,7 +279,7 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
         }
         frameIndex += framesPerMs
     }
-    // En cas de fin sur silence
+    
     if inSilence {
         let silenceFrames = totalFrames - silenceStartFrame
         let silenceDuration = Double(silenceFrames) / sampleRate
@@ -293,7 +288,6 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
         }
     }
     
-    // Reconstruction des segments non silencieux en se basant sur les intervalles de silence
     var nonSilentSegments = [CMTimeRange]()
     var lastEnd = 0
     for interval in silenceIntervals {
@@ -306,7 +300,6 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
         }
         lastEnd = interval.endFrame
     }
-    // Segment final après le dernier silence, s'il existe
     if lastEnd < totalFrames {
         let startSec = Double(lastEnd) / sampleRate
         let endSec = Double(totalFrames) / sampleRate
@@ -321,13 +314,11 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
     return nonSilentSegments
 }
 
-// La fonction suivante n'est plus utilisée pour recharger l'audio,
-// puisque nous le chargeons une seule fois lors de l'import.
+// Fonction auxiliaire (non utilisée si l'audio est déjà chargé)
 func detectNonSilentSegmentsInRAM(for asset: AVAsset,
                                   thresholdPercentage: Float,
                                   minSilenceDuration: Double,
                                   progressUpdate: @escaping (String) -> Void) -> [CMTimeRange] {
-    // On retombe ici uniquement si l'audio n'a pas été chargé auparavant.
     guard let result = loadAudioSamples(from: asset, progressUpdate: progressUpdate) else {
         return []
     }
@@ -343,24 +334,19 @@ func detectNonSilentSegmentsInRAM(for asset: AVAsset,
 struct ContentView: View {
     @State private var videoURL: URL? = nil
     @State private var destinationDirectory: URL? = nil
-    // Seuil en pourcentage (0 à 100) – par défaut 10%
-    @State private var threshold: Float = 1.0
-    // Durée minimale de silence pour être reconnu (exprimée en secondes, par ex. 0.5 s)
+    @State private var threshold: Float = 1.0        // Seuil par défaut 1%
     @State private var minSilenceDuration: Double = 0.5
     @State private var processing: Bool = false
     @State private var log: String = ""
     @State private var progressStatus: String = ""
     
-    // Stockage des segments non silencieux et de la composition traitée
     @State private var nonSilentSegments: [CMTimeRange] = []
     @State private var processedComposition: AVMutableComposition? = nil
     
-    // Audio chargé en RAM une seule fois lors de l'import
     @State private var audioSamples: [Float] = []
     @State private var sampleRate: Double = 44100.0
-    @State private var audioTimeScale: CMTimeScale = 1000  // 1 ms de précision
+    @State private var audioTimeScale: CMTimeScale = 1000
     
-    // Variables pour la prévisualisation
     @State private var showPreview: Bool = false
     @State private var showAlert: Bool = false
     @State private var alertMessage: String = ""
@@ -404,16 +390,14 @@ struct ContentView: View {
             }
             .padding(.bottom)
             
-            // Interface pour régler le seuil en pourcentage
             HStack {
-                Text("Seuil (%) : \(threshold, specifier: "%.1f")")
+                Text("Seuil (%) : \(String(format: "%.1f", threshold))")
                 Slider(value: $threshold, in: 1...100, step: 0.5)
             }
             .padding(.bottom)
             
-            // Contrôle de la durée minimale de silence (en secondes)
             HStack {
-                Text("Durée silence (s) : \(minSilenceDuration, specifier: "%.2f")")
+                Text("Durée silence (s) : \(String(format: "%.2f", minSilenceDuration))")
                 Slider(value: $minSilenceDuration, in: 0.1...2.0, step: 0.1)
             }
             .padding(.bottom)
@@ -474,7 +458,6 @@ struct ContentView: View {
         .overlay(previewOverlay)
     }
     
-    // MARK: - Overlay de prévisualisation
     @ViewBuilder
     private var previewOverlay: some View {
         if showPreview, let videoURL = videoURL {
@@ -494,7 +477,6 @@ struct ContentView: View {
         .transition(.opacity)
     }
     
-    // MARK: - Import / Glisser-Déposer
     func importVideo() {
         let panel = NSOpenPanel()
         panel.allowedFileTypes = ["mov", "mp4", "m4v"]
@@ -504,7 +486,7 @@ struct ContentView: View {
             nonSilentSegments = []
             processedComposition = nil
             progressStatus = ""
-            // Charger l'audio une seule fois à l'import
+            
             if let url = videoURL {
                 let asset = AVAsset(url: url)
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -536,6 +518,7 @@ struct ContentView: View {
                             nonSilentSegments = []
                             processedComposition = nil
                             progressStatus = ""
+                            
                             let asset = AVAsset(url: url)
                             DispatchQueue.global(qos: .userInitiated).async {
                                 if let result = loadAudioSamples(from: asset, progressUpdate: { update in
@@ -560,7 +543,6 @@ struct ContentView: View {
         return false
     }
     
-    // MARK: - Sélection dossier
     func selectDestinationFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -578,10 +560,8 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Construction de la composition (traitement vidéo)
     func buildComposition() {
         guard let videoURL = videoURL else { return }
-        // Si l'audio n'est pas déjà chargé, on affiche une erreur
         guard !audioSamples.isEmpty else {
             log += "Audio non chargé. Veuillez importer la vidéo.\n"
             return
@@ -592,13 +572,11 @@ struct ContentView: View {
         progressStatus = "Début du traitement vidéo..."
         
         let asset = AVAsset(url: videoURL)
-        
         DispatchQueue.global(qos: .userInitiated).async {
-            // Utilisation de l'audio déjà chargé pour détecter les segments non silencieux
             let segments = detectNonSilentSegmentsFromSamples(
                 samples: self.audioSamples,
                 sampleRate: self.sampleRate,
-                channels: 2,  // Ajustez si besoin selon le nombre de canaux
+                channels: 2,  // À ajuster selon le nombre de canaux
                 thresholdPercentage: self.threshold,
                 minSilenceDuration: self.minSilenceDuration,
                 progressUpdate: { update in
@@ -617,7 +595,6 @@ struct ContentView: View {
                 self.nonSilentSegments = segments
             }
             
-            // 2) Création de la composition
             let composition = AVMutableComposition()
             guard let videoTrack = asset.tracks(withMediaType: .video).first,
                   let audioTrack = asset.tracks(withMediaType: .audio).first,
@@ -633,13 +610,11 @@ struct ContentView: View {
                 return
             }
             
-            // 3) Traitement par boucle sur chacun des segments non silencieux
             let startTimeLocal = Date()
             var currentTime = CMTime.zero
             let totalSegments = segments.count
             
             for (index, originalSegment) in segments.enumerated() {
-                // Calcul de l'intersection entre les pistes vidéo et audio
                 let videoRange = videoTrack.timeRange
                 let audioRange = audioTrack.timeRange
                 let commonStart = max(videoRange.start, audioRange.start)
@@ -647,7 +622,6 @@ struct ContentView: View {
                                     audioRange.start + audioRange.duration)
                 let intersectionRange = CMTimeRange(start: commonStart, end: commonEnd)
                 
-                // Clamp du segment pour rester dans l'intersection
                 var start = originalSegment.start
                 var end = originalSegment.end
                 if start < intersectionRange.start { start = intersectionRange.start }
@@ -675,8 +649,7 @@ struct ContentView: View {
                 let avgTimePerSegment = elapsed / Double(index + 1)
                 let remainingTime = max(avgTimePerSegment * Double(totalSegments - (index + 1)), 0)
                 DispatchQueue.main.async {
-                    self.progressStatus = String(format: "Traitement vidéo : %.1f%%, temps restant ≈ %.1f s",
-                                                 progressPct, remainingTime)
+                    self.progressStatus = String(format: "Traitement vidéo : %.1f%%, temps restant ≈ %.1f s", progressPct, remainingTime)
                 }
             }
             
@@ -689,7 +662,6 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Export de la composition
     func exportComposition() {
         guard let composition = processedComposition else { return }
         processing = true
