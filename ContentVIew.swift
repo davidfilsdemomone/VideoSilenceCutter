@@ -15,7 +15,7 @@ struct WindowAccessor: NSViewRepresentable {
         }
         return NSView()
     }
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func updateNSView(_ nsView: NSView, context: Context) { }
 }
 
 extension View {
@@ -83,13 +83,14 @@ struct PreviewSheetView: View {
     }
     
     func addTimeObserver() {
+        // Actualisation toutes les 0.1 s pour la prévisualisation
         let interval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { currentTime in
             guard let lastSegment = segments.last else { return }
             let tolerance = CMTime(seconds: 0.1, preferredTimescale: lastSegment.end.timescale)
             let endMinusTolerance = lastSegment.end - tolerance
             
-            // Si on est arrivé à la fin du dernier segment
+            // Si on arrive à la fin du dernier segment
             if currentTime >= lastSegment.start && currentTime >= endMinusTolerance {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     dismiss()
@@ -128,7 +129,8 @@ func loadAudioSamples(from asset: AVAsset,
     
     let sampleRate = asbd.mSampleRate
     let channels = asbd.mChannelsPerFrame
-    let naturalTimeScale = audioTrack.naturalTimeScale
+    // Pour obtenir 1 ms de précision dans la création des segments
+    let timeScale: CMTimeScale = 1000
     let expectedDuration = asset.duration.seconds
     
     guard let reader = try? AVAssetReader(asset: asset) else {
@@ -184,96 +186,132 @@ func loadAudioSamples(from asset: AVAsset,
     progressUpdate(String(format:
         "Audio chargé (échantillons: %d, frames: %.0f), durée calculée = %.4f s, durée asset = %.1f s",
                            samples.count, totalFrames, computedDuration, expectedDuration))
-    return (samples, sampleRate, channels, naturalTimeScale)
+    return (samples, sampleRate, channels, timeScale)
 }
 
-// MARK: - Détection des segments non silencieux (en RAM, progression)
-func detectNonSilentSegmentsFromSamples(samples: [Float],
-                                        sampleRate: Double,
-                                        channels: UInt32,
-                                        threshold: Float,
-                                        minSilenceDuration: Double,
-                                        timescale: CMTimeScale,
-                                        progressUpdate: @escaping (String) -> Void)
--> [CMTimeRange] {
+// MARK: - Détection des segments non silencieux avec précision 1 ms
+// L'algorithme ci‑dessous utilise des pas de 1 ms (en nombre de frames)
+// pour calculer le RMS sur de petites fenêtres et détecter le silence.
+// Seul un silence dont la durée est supérieure ou égale à "minSilenceDuration"
+// (exprimée en secondes, par exemple 0.5 s) est considéré comme silence.
+func computeMaxRMS(samples: [Float],
+                   sampleRate: Double,
+                   channels: UInt32) -> Float {
     let totalFrames = samples.count / Int(channels)
-    let timePerFrame = 1.0 / sampleRate
-    let windowSizeInFrames = max(Int(sampleRate * minSilenceDuration), 1)
-    
-    var silenceIntervals = [(startFrame: Int, endFrame: Int)]()
-    var frameIndex = 0
-    let startTimeLocal = Date()
-    
-    while frameIndex < totalFrames {
-        let progress = Double(frameIndex) / Double(totalFrames) * 100
-        let elapsed = Date().timeIntervalSince(startTimeLocal)
-        let averageTimePerFrame = (frameIndex > 0) ? elapsed / Double(frameIndex) : 0
-        let framesLeft = Double(totalFrames - frameIndex)
-        let remainingTime = max(framesLeft * averageTimePerFrame, 0)
-        
-        DispatchQueue.main.async {
-            progressUpdate(String(format: "Analyse audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
-        }
-        
-        let windowEnd = min(frameIndex + windowSizeInFrames, totalFrames)
+    let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
+    var maxRMS: Float = 0
+    for frameIndex in stride(from: 0, to: totalFrames, by: framesPerMs) {
+        let windowEnd = min(frameIndex + framesPerMs, totalFrames)
         var sumSquares: Float = 0
-        let sampleCountInWindow = (windowEnd - frameIndex) * Int(channels)
+        let sampleCount = (windowEnd - frameIndex) * Int(channels)
         for f in frameIndex..<windowEnd {
             for c in 0..<channels {
                 let idx = f * Int(channels) + Int(c)
                 sumSquares += samples[idx] * samples[idx]
             }
         }
-        let rms = sqrt(sumSquares / Float(sampleCountInWindow))
-        let amplitudeDB = 20.0 * log10(rms)
+        let rms = sqrt(sumSquares / Float(sampleCount))
+        if rms > maxRMS {
+            maxRMS = rms
+        }
+    }
+    return maxRMS
+}
+
+func detectNonSilentSegmentsFromSamples(samples: [Float],
+                                          sampleRate: Double,
+                                          channels: UInt32,
+                                          // Seuil exprimé en pourcentage par rapport au maximum RMS
+                                          thresholdPercentage: Float,
+                                          // Durée minimale de silence (en secondes) pour être considérée comme silence
+                                          minSilenceDuration: Double,
+                                          progressUpdate: @escaping (String) -> Void)
+-> [CMTimeRange] {
+    let totalFrames = samples.count / Int(channels)
+    // Utilisation d'un pas fixe correspondant à environ 1 ms d'audio
+    let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
+    let timePerFrame = 1.0 / sampleRate
+    let timeScale: CMTimeScale = 1000  // Précision de 1 ms pour les CMTime
+
+    // Calcul du maximum de RMS sur des fenêtres de 1 ms
+    let maxRMS = computeMaxRMS(samples: samples, sampleRate: sampleRate, channels: channels)
+    let silenceThreshold = (thresholdPercentage / 100.0) * maxRMS
+    
+    var silenceIntervals = [(startFrame: Int, endFrame: Int)]()
+    var inSilence = false
+    var silenceStartFrame = 0
+    
+    let startTimeLocal = Date()
+    var frameIndex = 0
+    while frameIndex < totalFrames {
+        // Mise à jour périodique de la progression
+        let progress = Double(frameIndex) / Double(totalFrames) * 100
+        let elapsed = Date().timeIntervalSince(startTimeLocal)
+        let averageTimePerFrame = (frameIndex > 0) ? elapsed / Double(frameIndex) : 0
+        let framesLeft = Double(totalFrames - frameIndex)
+        let remainingTime = framesLeft * averageTimePerFrame
+        DispatchQueue.main.async {
+            progressUpdate(String(format: "Analyse audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
+        }
         
-        if amplitudeDB < threshold {
-            // On cherche la fin du silence
-            var j = windowEnd
-            while j < totalFrames {
-                let nextWindowEnd = min(j + windowSizeInFrames, totalFrames)
-                var sumSquares2: Float = 0
-                let count2 = (nextWindowEnd - j) * Int(channels)
-                for f in j..<nextWindowEnd {
-                    for c in 0..<channels {
-                        let idx = f * Int(channels) + Int(c)
-                        sumSquares2 += samples[idx] * samples[idx]
-                    }
-                }
-                let rms2 = sqrt(sumSquares2 / Float(count2))
-                let ampDB2 = 20.0 * log10(rms2)
-                if ampDB2 < threshold {
-                    j = nextWindowEnd
-                } else {
-                    break
-                }
+        let windowEnd = min(frameIndex + framesPerMs, totalFrames)
+        var sumSquares: Float = 0
+        let count = (windowEnd - frameIndex) * Int(channels)
+        for f in frameIndex..<windowEnd {
+            for c in 0..<channels {
+                let idx = f * Int(channels) + Int(c)
+                sumSquares += samples[idx] * samples[idx]
             }
-            // On a trouvé un silence [frameIndex, j[
-            silenceIntervals.append((startFrame: frameIndex, endFrame: j))
-            frameIndex = j
+        }
+        let rms = sqrt(sumSquares / Float(count))
+        
+        if rms < silenceThreshold {
+            if !inSilence {
+                // Début d'un silence
+                inSilence = true
+                silenceStartFrame = frameIndex
+            }
         } else {
-            frameIndex += windowSizeInFrames
+            if inSilence {
+                // Fin du silence détecté ; on vérifie sa durée
+                let silenceFrames = frameIndex - silenceStartFrame
+                let silenceDuration = Double(silenceFrames) / sampleRate
+                if silenceDuration >= minSilenceDuration {
+                    silenceIntervals.append((startFrame: silenceStartFrame, endFrame: frameIndex))
+                }
+                inSilence = false
+            }
+        }
+        frameIndex += framesPerMs
+    }
+    // En cas de fin sur silence
+    if inSilence {
+        let silenceFrames = totalFrames - silenceStartFrame
+        let silenceDuration = Double(silenceFrames) / sampleRate
+        if silenceDuration >= minSilenceDuration {
+            silenceIntervals.append((startFrame: silenceStartFrame, endFrame: totalFrames))
         }
     }
     
+    // Reconstruction des segments non silencieux en se basant sur les intervalles de silence
     var nonSilentSegments = [CMTimeRange]()
     var lastEnd = 0
     for interval in silenceIntervals {
         if interval.startFrame > lastEnd {
-            let startSec = Double(lastEnd) * timePerFrame
-            let endSec = Double(interval.startFrame) * timePerFrame
-            let startCM = CMTime(seconds: startSec, preferredTimescale: timescale)
-            let endCM   = CMTime(seconds: endSec,   preferredTimescale: timescale)
+            let startSec = Double(lastEnd) / sampleRate
+            let endSec = Double(interval.startFrame) / sampleRate
+            let startCM = CMTime(seconds: startSec, preferredTimescale: timeScale)
+            let endCM   = CMTime(seconds: endSec, preferredTimescale: timeScale)
             nonSilentSegments.append(CMTimeRange(start: startCM, end: endCM))
         }
         lastEnd = interval.endFrame
     }
-    // S'il reste un segment après le dernier silence
+    // Segment final après le dernier silence, s'il existe
     if lastEnd < totalFrames {
-        let startSec = Double(lastEnd) * timePerFrame
-        let endSec   = Double(totalFrames) * timePerFrame
-        let startCM  = CMTime(seconds: startSec, preferredTimescale: timescale)
-        let endCM    = CMTime(seconds: endSec,   preferredTimescale: timescale)
+        let startSec = Double(lastEnd) / sampleRate
+        let endSec = Double(totalFrames) / sampleRate
+        let startCM = CMTime(seconds: startSec, preferredTimescale: timeScale)
+        let endCM = CMTime(seconds: endSec, preferredTimescale: timeScale)
         nonSilentSegments.append(CMTimeRange(start: startCM, end: endCM))
     }
     
@@ -283,19 +321,21 @@ func detectNonSilentSegmentsFromSamples(samples: [Float],
     return nonSilentSegments
 }
 
+// La fonction suivante n'est plus utilisée pour recharger l'audio,
+// puisque nous le chargeons une seule fois lors de l'import.
 func detectNonSilentSegmentsInRAM(for asset: AVAsset,
-                                  threshold: Float,
+                                  thresholdPercentage: Float,
                                   minSilenceDuration: Double,
                                   progressUpdate: @escaping (String) -> Void) -> [CMTimeRange] {
+    // On retombe ici uniquement si l'audio n'a pas été chargé auparavant.
     guard let result = loadAudioSamples(from: asset, progressUpdate: progressUpdate) else {
         return []
     }
     return detectNonSilentSegmentsFromSamples(samples: result.samples,
                                               sampleRate: result.sampleRate,
                                               channels: result.channels,
-                                              threshold: threshold,
+                                              thresholdPercentage: thresholdPercentage,
                                               minSilenceDuration: minSilenceDuration,
-                                              timescale: result.timeScale,
                                               progressUpdate: progressUpdate)
 }
 
@@ -303,26 +343,27 @@ func detectNonSilentSegmentsInRAM(for asset: AVAsset,
 struct ContentView: View {
     @State private var videoURL: URL? = nil
     @State private var destinationDirectory: URL? = nil
-    @State private var threshold: Float = -65.0
+    // Seuil en pourcentage (0 à 100) – par défaut 10%
+    @State private var threshold: Float = 10.0
+    // Durée minimale de silence pour être reconnu (exprimée en secondes, par ex. 0.5 s)
     @State private var minSilenceDuration: Double = 0.5
     @State private var processing: Bool = false
     @State private var log: String = ""
-    
     @State private var progressStatus: String = ""
     
     // Stockage des segments non silencieux et de la composition traitée
     @State private var nonSilentSegments: [CMTimeRange] = []
     @State private var processedComposition: AVMutableComposition? = nil
     
+    // Audio chargé en RAM une seule fois lors de l'import
+    @State private var audioSamples: [Float] = []
+    @State private var sampleRate: Double = 44100.0
+    @State private var audioTimeScale: CMTimeScale = 1000  // 1 ms de précision
+    
     // Variables pour la prévisualisation
     @State private var showPreview: Bool = false
     @State private var showAlert: Bool = false
     @State private var alertMessage: String = ""
-    
-    // Audio en RAM
-    @State private var audioSamples: [Float] = []
-    @State private var sampleRate: Double = 44100.0
-    @State private var audioTimeScale: CMTimeScale = 600
     
     var body: some View {
         VStack(alignment: .leading) {
@@ -363,12 +404,14 @@ struct ContentView: View {
             }
             .padding(.bottom)
             
+            // Interface pour régler le seuil en pourcentage
             HStack {
-                Text("Seuil (dB) : \(threshold, specifier: "%.1f")")
-                Slider(value: $threshold, in: -80...0, step: 0.5)
+                Text("Seuil (%) : \(threshold, specifier: "%.1f")")
+                Slider(value: $threshold, in: 1...100, step: 0.5)
             }
             .padding(.bottom)
             
+            // Contrôle de la durée minimale de silence (en secondes)
             HStack {
                 Text("Durée silence (s) : \(minSilenceDuration, specifier: "%.2f")")
                 Slider(value: $minSilenceDuration, in: 0.1...2.0, step: 0.1)
@@ -451,7 +494,7 @@ struct ContentView: View {
         .transition(.opacity)
     }
     
-    // MARK: - Import / glisser-déposer
+    // MARK: - Import / Glisser-Déposer
     func importVideo() {
         let panel = NSOpenPanel()
         panel.allowedFileTypes = ["mov", "mp4", "m4v"]
@@ -461,6 +504,7 @@ struct ContentView: View {
             nonSilentSegments = []
             processedComposition = nil
             progressStatus = ""
+            // Charger l'audio une seule fois à l'import
             if let url = videoURL {
                 let asset = AVAsset(url: url)
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -473,7 +517,7 @@ struct ContentView: View {
                             self.audioSamples = result.samples
                             self.sampleRate = result.sampleRate
                             self.audioTimeScale = result.timeScale
-                            log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels), timescale=\(self.audioTimeScale)).\n"
+                            log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels)).\n"
                         }
                     }
                 }
@@ -503,7 +547,7 @@ struct ContentView: View {
                                         self.audioSamples = result.samples
                                         self.sampleRate = result.sampleRate
                                         self.audioTimeScale = result.timeScale
-                                        log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels), timescale=\(self.audioTimeScale)).\n"
+                                        log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels)).\n"
                                     }
                                 }
                             }
@@ -537,6 +581,12 @@ struct ContentView: View {
     // MARK: - Construction de la composition (traitement vidéo)
     func buildComposition() {
         guard let videoURL = videoURL else { return }
+        // Si l'audio n'est pas déjà chargé, on affiche une erreur
+        guard !audioSamples.isEmpty else {
+            log += "Audio non chargé. Veuillez importer la vidéo.\n"
+            return
+        }
+        
         processing = true
         log = "Début du traitement...\n"
         progressStatus = "Début du traitement vidéo..."
@@ -544,48 +594,30 @@ struct ContentView: View {
         let asset = AVAsset(url: videoURL)
         
         DispatchQueue.global(qos: .userInitiated).async {
-            // 1) Déterminer les segments
-            let segments: [CMTimeRange]
-            if !self.audioSamples.isEmpty {
-                segments = detectNonSilentSegmentsFromSamples(
-                    samples: self.audioSamples,
-                    sampleRate: self.sampleRate,
-                    channels: 2, // Ajustez si besoin
-                    threshold: self.threshold,
-                    minSilenceDuration: self.minSilenceDuration,
-                    timescale: self.audioTimeScale,
-                    progressUpdate: { update in
-                        DispatchQueue.main.async {
-                            progressStatus = update
-                        }
-                    }
-                )
-                DispatchQueue.main.async {
-                    self.log += "Détection via RAM : \(segments.count) segments trouvés.\n"
-                    for seg in segments {
-                        let st = CMTimeGetSeconds(seg.start)
-                        let en = CMTimeGetSeconds(seg.end)
-                        self.log += String(format: "Segment: %.3f s -> %.3f s\n", st, en)
-                    }
-                }
-            } else {
-                segments = detectNonSilentSegmentsInRAM(
-                    for: asset,
-                    threshold: self.threshold,
-                    minSilenceDuration: self.minSilenceDuration
-                ) { update in
+            // Utilisation de l'audio déjà chargé pour détecter les segments non silencieux
+            let segments = detectNonSilentSegmentsFromSamples(
+                samples: self.audioSamples,
+                sampleRate: self.sampleRate,
+                channels: 2,  // Ajustez si besoin selon le nombre de canaux
+                thresholdPercentage: self.threshold,
+                minSilenceDuration: self.minSilenceDuration,
+                progressUpdate: { update in
                     DispatchQueue.main.async {
                         progressStatus = update
                     }
                 }
-            }
-            
+            )
             DispatchQueue.main.async {
-                self.log += "Segments non silencieux détectés : \(segments)\n"
+                self.log += "Détection via RAM : \(segments.count) segments trouvés.\n"
+                for seg in segments {
+                    let st = CMTimeGetSeconds(seg.start)
+                    let en = CMTimeGetSeconds(seg.end)
+                    self.log += String(format: "Segment: %.3f s -> %.3f s\n", st, en)
+                }
                 self.nonSilentSegments = segments
             }
             
-            // 2) Création composition
+            // 2) Création de la composition
             let composition = AVMutableComposition()
             guard let videoTrack = asset.tracks(withMediaType: .video).first,
                   let audioTrack = asset.tracks(withMediaType: .audio).first,
@@ -601,13 +633,13 @@ struct ContentView: View {
                 return
             }
             
-            // 3) Traitement par boucle
+            // 3) Traitement par boucle sur chacun des segments non silencieux
             let startTimeLocal = Date()
             var currentTime = CMTime.zero
             let totalSegments = segments.count
             
             for (index, originalSegment) in segments.enumerated() {
-                // Intersection piste video/audio
+                // Calcul de l'intersection entre les pistes vidéo et audio
                 let videoRange = videoTrack.timeRange
                 let audioRange = audioTrack.timeRange
                 let commonStart = max(videoRange.start, audioRange.start)
@@ -615,7 +647,7 @@ struct ContentView: View {
                                     audioRange.start + audioRange.duration)
                 let intersectionRange = CMTimeRange(start: commonStart, end: commonEnd)
                 
-                // Clamp
+                // Clamp du segment pour rester dans l'intersection
                 var start = originalSegment.start
                 var end = originalSegment.end
                 if start < intersectionRange.start { start = intersectionRange.start }
@@ -657,7 +689,7 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Export
+    // MARK: - Export de la composition
     func exportComposition() {
         guard let composition = processedComposition else { return }
         processing = true
