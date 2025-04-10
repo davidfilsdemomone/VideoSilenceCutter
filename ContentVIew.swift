@@ -344,7 +344,7 @@ struct ContentView: View {
     @State private var videoURL: URL? = nil
     @State private var destinationDirectory: URL? = nil
     // Seuil en pourcentage (0 à 100) – par défaut 10%
-    @State private var threshold: Float = 10.0
+    @State private var threshold: Float = 1.0
     // Durée minimale de silence pour être reconnu (exprimée en secondes, par ex. 0.5 s)
     @State private var minSilenceDuration: Double = 0.5
     @State private var processing: Bool = false
