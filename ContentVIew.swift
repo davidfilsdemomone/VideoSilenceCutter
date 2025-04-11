@@ -28,7 +28,6 @@ func computeMaxRMS(samples: [Float],
     let totalSamples = samples.count
     let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
     var maxRMS: Float = 0
-    
     var squares = [Float](repeating: 0, count: samples.count)
     vDSP_vsq(samples, 1, &squares, 1, vDSP_Length(samples.count))
     
@@ -58,7 +57,6 @@ func computeMaxRMSWithProgress(samples: [Float],
         let totalSamples = samples.count
         let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
         var maxRMS: Float = 0
-        
         var squares = [Float](repeating: 0, count: samples.count)
         vDSP_vsq(samples, 1, &squares, 1, vDSP_Length(samples.count))
         
@@ -285,28 +283,29 @@ func loadAudioSamples(from asset: AVAsset,
 }
 
 // ===================================================
-// MARK: - Détection des segments non silencieux par suppression stricte du silence
+// MARK: - Détection automatique des seuils, interpolation et compensation
 //
-// Cette fonction découpe l’audio en fenêtres de 10 ms avec recouvrement de 5 ms.
-// Pour chaque fenêtre, on calcule le niveau RMS en dB et on la marque comme silencieuse
-// si le niveau est inférieur à silenceThresholddB (ici réglable via l’interface, défaut = -50 dB).
-// Ensuite, les fenêtres silencieuses consécutives dont la durée totale est ≥ minSilenceDuration sont considérées comme des silences à retirer.
-// Les segments non silencieux sont alors déduits comme l’ensemble des intervalles hors de ces silences.
-func detectNonSilentSegmentsByRemovingSilence(samples: [Float],
-                                                sampleRate: Double,
-                                                channels: UInt32,
-                                                silenceThresholddB: Float,
-                                                minSilenceDuration: Double,
-                                                progressUpdate: @escaping (String) -> Void)
+// Cette fonction découpe l’audio en fenêtres de 10 ms (avec un hop de 3 ms), calcule le niveau RMS en dB,
+// lisse les valeurs avec une moyenne mobile et détecte automatiquement les seuils de silence
+// via les percentiles. Elle affine la détection des transitions grâce à une interpolation linéaire
+// et applique un offset de compensation de 20 ms pour capter le début du non-silence.
+func detectNonSilentSegmentsAuto(samples: [Float],
+                                 sampleRate: Double,
+                                 channels: UInt32,
+                                 minSilenceDuration: Double,
+                                 smoothingWindow: Int = 5,
+                                 progressUpdate: @escaping (String) -> Void)
 -> [CMTimeRange] {
     let windowDuration: Double = 0.01  // 10 ms
-    let hopDuration: Double = 0.005      // 5 ms de recouvrement
+    let hopDuration: Double = 0.003      // 3 ms pour une meilleure résolution
     let windowFrameCount = Int(sampleRate * windowDuration)
     let hopFrameCount = Int(sampleRate * hopDuration)
     let totalFrames = samples.count / Int(channels)
     let totalWindows = max(0, ((totalFrames - windowFrameCount) / hopFrameCount) + 1)
     
-    var silenceWindowTimes = [(start: Double, end: Double)]()
+    var dBValues = [Float]()
+    var windowTimes = [Double]()
+    
     for i in 0..<totalWindows {
         let startFrame = i * hopFrameCount
         let sampleStartIndex = startFrame * Int(channels)
@@ -316,43 +315,70 @@ func detectNonSilentSegmentsByRemovingSilence(samples: [Float],
         var rms: Float = 0
         vDSP_rmsqv(windowSamples, 1, &rms, vDSP_Length(windowSamples.count))
         let rmsdB = 20 * log10(rms + 1e-9)
+        dBValues.append(rmsdB)
         let windowStartTime = Double(i) * hopDuration
-        let windowEndTime = windowStartTime + windowDuration
-        if rmsdB < silenceThresholddB {
-            silenceWindowTimes.append((start: windowStartTime, end: windowEndTime))
-        }
+        windowTimes.append(windowStartTime)
+        
         if i % 100 == 0 {
             let progress = Double(i) / Double(totalWindows) * 100
             DispatchQueue.main.async {
-                progressUpdate(String(format: "Analyse silence : %.1f%%", progress))
+                progressUpdate(String(format: "Analyse silence (auto) : %.1f%%", progress))
             }
         }
     }
     
-    var removalIntervals = [(start: Double, end: Double)]()
-    if !silenceWindowTimes.isEmpty {
-        var currentStart = silenceWindowTimes[0].start
-        var currentEnd = silenceWindowTimes[0].end
-        for entry in silenceWindowTimes.dropFirst() {
-            if entry.start <= currentEnd + 0.001 {
-                currentEnd = entry.end
-            } else {
-                if currentEnd - currentStart >= minSilenceDuration {
-                    removalIntervals.append((start: currentStart, end: currentEnd))
-                }
-                currentStart = entry.start
-                currentEnd = entry.end
-            }
+    // Lissage des valeurs dB (moyenne mobile)
+    let smootheddB = smooth(values: dBValues, windowSize: smoothingWindow)
+    
+    // Détection automatique des seuils à partir des valeurs lissées
+    let (autoSilenceThreshold, autoNonSilenceThreshold) = autoDetectThresholds(from: smootheddB)
+    print("Seuils auto-détectés : Silence = \(autoSilenceThreshold) dB, Non silence = \(autoNonSilenceThreshold) dB")
+    
+    // Compensation offset en secondes (ici 20 ms pour capter le début réellement audible du son)
+    let compensationOffset: Double = 0.100
+    
+    // Détection des intervalles de silence avec interpolation et compensation
+    var silenceIntervals = [(start: Double, end: Double)]()
+    var isSilence = false
+    var silenceStart: Double = 0
+    
+    for (index, dB) in smootheddB.enumerated() {
+        let time = windowTimes[index]
+        if !isSilence && dB < autoSilenceThreshold {
+            isSilence = true
+            silenceStart = time
         }
-        if currentEnd - currentStart >= minSilenceDuration {
-            removalIntervals.append((start: currentStart, end: currentEnd))
+        if isSilence && dB > autoNonSilenceThreshold {
+            // Interpolation linéaire pour affiner la transition
+            var transitionTime = time
+            if index > 0 {
+                let prevTime = windowTimes[index - 1]
+                let prevDB = smootheddB[index - 1]
+                if dB != prevDB {
+                    let ratio = (autoNonSilenceThreshold - prevDB) / (dB - prevDB)
+                    transitionTime = prevTime + (time - prevTime) * Double(ratio)
+                }
+            }
+            // Appliquer la compensation : on recule le temps de transition de compensationOffset
+            let adjustedTransitionTime = max(transitionTime - compensationOffset, silenceStart)
+            if adjustedTransitionTime - silenceStart >= minSilenceDuration {
+                silenceIntervals.append((start: silenceStart, end: adjustedTransitionTime))
+            }
+            isSilence = false
+        }
+    }
+    if isSilence {
+        let lastTime = windowTimes.last ?? 0
+        let adjustedLastTime = max(lastTime - compensationOffset, silenceStart)
+        if adjustedLastTime - silenceStart >= minSilenceDuration {
+            silenceIntervals.append((start: silenceStart, end: adjustedLastTime))
         }
     }
     
     let audioDuration = Double(totalFrames) / sampleRate
     var nonSilentSegments = [CMTimeRange]()
     var previousEnd = 0.0
-    for interval in removalIntervals {
+    for interval in silenceIntervals {
         if interval.start > previousEnd {
             nonSilentSegments.append(
                 CMTimeRange(start: CMTime(seconds: previousEnd, preferredTimescale: 1000),
@@ -369,9 +395,46 @@ func detectNonSilentSegmentsByRemovingSilence(samples: [Float],
     }
     
     DispatchQueue.main.async {
-        progressUpdate("Analyse segments terminée.")
+        progressUpdate("Analyse segments terminée (auto, interpolation affinée).")
     }
     return nonSilentSegments
+}
+
+// ===================================================
+// MARK: - Fonction de lissage (moyenne mobile)
+// ===================================================
+func smooth(values: [Float], windowSize: Int) -> [Float] {
+    guard windowSize > 1, values.count > windowSize else { return values }
+    var smoothed = [Float](repeating: 0, count: values.count)
+    let halfWindow = windowSize / 2
+    for i in 0..<values.count {
+        var sum: Float = 0
+        var count = 0
+        for j in max(0, i - halfWindow)...min(values.count - 1, i + halfWindow) {
+            sum += values[j]
+            count += 1
+        }
+        smoothed[i] = sum / Float(count)
+    }
+    return smoothed
+}
+
+// ===================================================
+// MARK: - Détection automatique des seuils à partir d'un ensemble de valeurs
+// ===================================================
+func autoDetectThresholds(from values: [Float]) -> (silenceThreshold: Float, nonSilenceThreshold: Float) {
+    let sorted = values.sorted()
+    // Calcul des percentiles 10 et 90
+    let lowerIndex = Int(Float(sorted.count - 1) * 0.1)
+    let upperIndex = Int(Float(sorted.count - 1) * 0.9)
+    let p10 = sorted[lowerIndex]
+    let p90 = sorted[upperIndex]
+    let mid = (p10 + p90) / 2.0
+    // Définir une marge avec un minimum de 5 dB
+    let hysteresis = max((p90 - p10) * 0.2, 5)
+    let silenceThreshold = mid - hysteresis / 2.0
+    let nonSilenceThreshold = mid + hysteresis / 2.0
+    return (silenceThreshold, nonSilenceThreshold)
 }
 
 // ===================================================
@@ -381,10 +444,7 @@ struct ContentView: View {
     @State private var videoURL: URL? = nil
     @State private var destinationDirectory: URL? = nil
     
-    // Ici, silenceThresholddB représente le seuil en dB en dessous duquel une fenêtre est considérée comme silencieuse.
-    // On le met par défaut à -50 dB, et le slider permet de régler entre -90 dB (silence très parfait)
-    // et -20 dB (seuil très haut).
-    @State private var silenceThresholddB: Float = -50.0
+    // Seul le réglage de la durée minimale de silence à retirer reste modifiable
     @State private var minSilenceDuration: Double = 0.5
     
     @State private var processing: Bool = false
@@ -445,15 +505,7 @@ struct ContentView: View {
             }
             .padding(.bottom)
             
-            // Contrôle du seuil de détection du silence
-            HStack {
-                Text("Seuil silence (dB) : \(String(format: "%.1f", silenceThresholddB))")
-                // Nouvelle plage du slider : de -90 dB à -20 dB
-                Slider(value: $silenceThresholddB, in: -90 ... -20, step: 1)
-            }
-            .padding(.bottom)
-            
-            // Contrôle de la durée minimale de silence à retirer
+            // Réglage du temps minimum de silence à retirer
             HStack {
                 Text("Silence à retirer (s) : \(String(format: "%.2f", minSilenceDuration))")
                 Slider(value: $minSilenceDuration, in: 0.1...2.0, step: 0.1)
@@ -672,11 +724,11 @@ struct ContentView: View {
         
         let asset = AVAsset(url: videoURL)
         DispatchQueue.global(qos: .userInitiated).async {
-            let segments = detectNonSilentSegmentsByRemovingSilence(
+            // Utilisation de la détection automatique des seuils, interpolation affinée et compensation
+            let segments = detectNonSilentSegmentsAuto(
                 samples: self.audioSamples,
                 sampleRate: self.sampleRate,
                 channels: 2,
-                silenceThresholddB: self.silenceThresholddB,
                 minSilenceDuration: self.minSilenceDuration,
                 progressUpdate: { update in
                     DispatchQueue.main.async {
