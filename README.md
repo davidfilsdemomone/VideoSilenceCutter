@@ -16,6 +16,10 @@ La durée minimale en secondes d'un silence à supprimer.
 
 Traitement optimisé : Découpe intelligente des segments silencieux sans perte de qualité.
 
+⚙️ Guide d'installation sur votre mac
+
+Si vous avez un mac et Xcode, copiez-coller ce fichier dans votre projet à la place du fichier ContentView.swift !
+
 ⚙️ Guide d'utilisation rapide
 
 Importez votre vidéo.
