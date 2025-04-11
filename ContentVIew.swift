@@ -2,6 +2,21 @@ import SwiftUI
 import AVFoundation
 import AVKit
 import AppKit
+import Accelerate
+
+// MARK: - Fonction de normalisation
+// Normalise les échantillons uniquement si le maximum absolu > 1 (pour éviter de diminuer un signal déjà normalisé)
+func normalizeSamples(_ samples: [Float]) -> [Float] {
+    var absSamples = [Float](repeating: 0, count: samples.count)
+    vDSP_vabs(samples, 1, &absSamples, 1, vDSP_Length(samples.count))
+    var maxVal: Float = 0
+    vDSP_maxv(absSamples, 1, &maxVal, vDSP_Length(absSamples.count))
+    if maxVal <= 1 { return samples }
+    var normalized = [Float](repeating: 0, count: samples.count)
+    var divisor = maxVal
+    vDSP_vsdiv(samples, 1, &divisor, &normalized, 1, vDSP_Length(samples.count))
+    return normalized
+}
 
 // MARK: - Extension pour fixer la taille de la fenêtre (non redimensionnable)
 struct WindowAccessor: NSViewRepresentable {
@@ -15,7 +30,6 @@ struct WindowAccessor: NSViewRepresentable {
         }
         return NSView()
     }
-    
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
@@ -40,12 +54,11 @@ struct PlayerView: NSViewRepresentable {
 }
 
 // MARK: - Vue de prévisualisation (Sheet)
-// Utilisation d'un DispatchSourceTimer haute fréquence pour tenter une actualisation toutes les 1 ms (logique)
 struct PreviewSheetView: View {
     let player: AVPlayer
     let segments: [CMTimeRange]
     let dismiss: () -> Void
-    
+
     @State private var highResTimer: DispatchSourceTimer?
     
     var body: some View {
@@ -53,13 +66,11 @@ struct PreviewSheetView: View {
             Color.black.opacity(0.4)
                 .edgesIgnoringSafeArea(.all)
                 .onTapGesture { cleanupAndDismiss() }
-            
             PlayerView(player: player)
                 .frame(width: 800, height: 450)
                 .cornerRadius(10)
                 .shadow(radius: 10)
                 .onTapGesture { }
-            
             VStack {
                 HStack {
                     Spacer()
@@ -85,7 +96,6 @@ struct PreviewSheetView: View {
         }
     }
     
-    // Mise en place d'un timer DispatchSource déclenché toutes les 1 ms
     func setupHighResTimer() {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
         timer.schedule(deadline: .now(), repeating: .milliseconds(1), leeway: .milliseconds(0))
@@ -95,12 +105,10 @@ struct PreviewSheetView: View {
             let tolerance = CMTime(seconds: 0.001, preferredTimescale: lastSegment.end.timescale)
             let endMinusTolerance = lastSegment.end - tolerance
             
-            // Si le temps courant atteint ou dépasse la fin du dernier segment (avec tolérance), on ferme la prévisualisation.
             if currentTime >= lastSegment.start && currentTime >= endMinusTolerance {
                 cleanupAndDismiss()
                 return
             }
-            // Si le temps courant n'appartient pas à un segment, on saute vers le prochain segment.
             if !segments.contains(where: { $0.start <= currentTime && currentTime < $0.end }) {
                 if let nextSegment = segments.first(where: { $0.start > currentTime }) {
                     player.seek(to: nextSegment.start, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
@@ -139,7 +147,7 @@ func loadAudioSamples(from asset: AVAsset,
     }
     let sampleRate = asbd.mSampleRate
     let channels = asbd.mChannelsPerFrame
-    let timeScale: CMTimeScale = 1000  // 1 ms de précision
+    let timeScale: CMTimeScale = 1000  // 1 ms
     let expectedDuration = asset.duration.seconds
     
     guard let reader = try? AVAssetReader(asset: asset) else {
@@ -174,14 +182,13 @@ func loadAudioSamples(from asset: AVAsset,
                 let sampleCount = length / MemoryLayout<Float>.size
                 let bufferPointer = UnsafeBufferPointer<Float>(
                     start: UnsafeRawPointer(dataPointer).assumingMemoryBound(to: Float.self),
-                    count: sampleCount
-                )
+                    count: sampleCount)
                 samples.append(contentsOf: bufferPointer)
                 currentSampleCount += sampleCount
                 
                 let progress = min(Double(currentSampleCount) / Double(totalSamplesEstimated) * 100, 100)
                 let elapsed = Date().timeIntervalSince(startTimeLocal)
-                let averageTimePerSample = (currentSampleCount > 0) ? elapsed / Double(currentSampleCount) : 0
+                let averageTimePerSample = (Double(currentSampleCount) > 0) ? elapsed / Double(currentSampleCount) : 0
                 let samplesLeft = Double(totalSamplesEstimated - currentSampleCount)
                 let remainingTime = max(samplesLeft * averageTimePerSample, 0)
                 progressUpdate(String(format: "Chargement audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
@@ -190,155 +197,177 @@ func loadAudioSamples(from asset: AVAsset,
     }
     let totalFrames = Double(samples.count) / Double(channels)
     let computedDuration = totalFrames / sampleRate
-    progressUpdate(String(format:
-        "Audio chargé (échantillons: %d, frames: %.0f), durée calculée = %.4f s, durée asset = %.1f s",
-                           samples.count, totalFrames, computedDuration, expectedDuration))
-    return (samples, sampleRate, channels, timeScale)
+    progressUpdate(String(format: "Audio chargé (échantillons: %d, frames: %.0f), durée calculée = %.4f s, durée asset = %.1f s", samples.count, totalFrames, computedDuration, expectedDuration))
+    // Normalisation : on ne normalise que si le peak > 1.0
+    let normalizedSamples = normalizeSamples(samples)
+    return (normalizedSamples, sampleRate, channels, timeScale)
 }
 
-// MARK: - Détection des segments non silencieux avec précision 1 ms
-func computeMaxRMS(samples: [Float],
-                   sampleRate: Double,
-                   channels: UInt32) -> Float {
-    let totalFrames = samples.count / Int(channels)
+// MARK: - computeMaxRMS (version accélérée sans progression)
+// Calcule le max RMS en amplitude linéaire sur des échantillons normalisés.
+func computeMaxRMS(samples: [Float], sampleRate: Double, channels: UInt32) -> Float {
+    let totalSamples = samples.count
     let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
     var maxRMS: Float = 0
-    for frameIndex in stride(from: 0, to: totalFrames, by: framesPerMs) {
-        let windowEnd = min(frameIndex + framesPerMs, totalFrames)
-        var sumSquares: Float = 0
-        let sampleCount = (windowEnd - frameIndex) * Int(channels)
-        for f in frameIndex..<windowEnd {
-            for c in 0..<channels {
-                let idx = f * Int(channels) + Int(c)
-                sumSquares += samples[idx] * samples[idx]
-            }
-        }
-        let rms = sqrt(sumSquares / Float(sampleCount))
-        if rms > maxRMS {
-            maxRMS = rms
-        }
+    var squares = [Float](repeating: 0, count: totalSamples)
+    vDSP_vsq(samples, 1, &squares, 1, vDSP_Length(totalSamples))
+    
+    let blockSize = framesPerMs * Int(channels)
+    let numBlocks = Int(ceil(Double(totalSamples) / Double(blockSize)))
+    for block in 0..<numBlocks {
+        let start = block * blockSize
+        if start >= totalSamples { break }
+        let currentBlockSize = min(blockSize, totalSamples - start)
+        var sum: Float = 0
+        vDSP_sve(&squares[start], 1, &sum, vDSP_Length(currentBlockSize))
+        let rms = sqrt(sum / Float(currentBlockSize))
+        if rms > maxRMS { maxRMS = rms }
     }
     return maxRMS
 }
 
+// MARK: - computeMaxRMSWithProgress (version accélérée et vectorisée)
+func computeMaxRMSWithProgress(samples: [Float],
+                               sampleRate: Double,
+                               channels: UInt32,
+                               progressUpdate: @escaping (String) -> Void,
+                               completion: @escaping (Float) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let totalSamples = samples.count
+        let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
+        var maxRMS: Float = 0
+        
+        var squares = [Float](repeating: 0, count: totalSamples)
+        vDSP_vsq(samples, 1, &squares, 1, vDSP_Length(totalSamples))
+        
+        let blockSize = framesPerMs * Int(channels)
+        let numBlocks = Int(ceil(Double(totalSamples) / Double(blockSize)))
+        let startTime = Date()
+        
+        for block in 0..<numBlocks {
+            let start = block * blockSize
+            if start >= totalSamples { break }
+            let currentBlockSize = min(blockSize, totalSamples - start)
+            var sum: Float = 0
+            vDSP_sve(&squares[start], 1, &sum, vDSP_Length(currentBlockSize))
+            let rms = sqrt(sum / Float(currentBlockSize))
+            if rms > maxRMS { maxRMS = rms }
+            
+            if block % 100 == 0 {
+                let progress = Double(block + 1) / Double(numBlocks) * 100
+                let elapsed = Date().timeIntervalSince(startTime)
+                let estimatedTotalTime = elapsed * Double(numBlocks) / Double(block + 1)
+                let remainingTime = max(estimatedTotalTime - elapsed, 0)
+                let progressString = String(format: "Détection max dB : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime)
+                DispatchQueue.main.async {
+                    progressUpdate(progressString)
+                }
+            }
+        }
+        DispatchQueue.main.async {
+            completion(maxRMS)
+        }
+    }
+}
+
+// MARK: - detectNonSilentSegmentsFromSamples (version accélérée, seuil en dB)
+// Ici, nous utilisons un seuil de silence en dB (par exemple -40 dB). Pour chaque bloc (~1 ms),
+// nous calculons le RMS, le convertissons en dB, et déterminons si le bloc est "non silencieux" (>= seuil).
 func detectNonSilentSegmentsFromSamples(samples: [Float],
                                         sampleRate: Double,
                                         channels: UInt32,
-                                        thresholdPercentage: Float,
+                                        silenceThresholddB: Float,
                                         minSilenceDuration: Double,
                                         progressUpdate: @escaping (String) -> Void)
 -> [CMTimeRange] {
     let totalFrames = samples.count / Int(channels)
     let framesPerMs = max(Int(round(sampleRate / 1000.0)), 1)
-    let timeScale: CMTimeScale = 1000  // Précision 1 ms
+    let timeScale: CMTimeScale = 1000
     
-    let maxRMS = computeMaxRMS(samples: samples, sampleRate: sampleRate, channels: channels)
-    let silenceThreshold = (thresholdPercentage / 100.0) * maxRMS
-    
-    var silenceIntervals = [(startFrame: Int, endFrame: Int)]()
-    var inSilence = false
-    var silenceStartFrame = 0
-    let startTimeLocal = Date()
-    var frameIndex = 0
-    
-    while frameIndex < totalFrames {
-        let progress = Double(frameIndex) / Double(totalFrames) * 100
-        let elapsed = Date().timeIntervalSince(startTimeLocal)
-        let avgTimePerFrame = frameIndex > 0 ? elapsed / Double(frameIndex) : 0
-        let framesLeft = Double(totalFrames - frameIndex)
-        let remainingTime = framesLeft * avgTimePerFrame
-        DispatchQueue.main.async {
-            progressUpdate(String(format: "Analyse audio : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
-        }
-        
-        let windowEnd = min(frameIndex + framesPerMs, totalFrames)
-        var sumSquares: Float = 0
-        let count = (windowEnd - frameIndex) * Int(channels)
-        for f in frameIndex..<windowEnd {
-            for c in 0..<channels {
-                let idx = f * Int(channels) + Int(c)
-                sumSquares += samples[idx] * samples[idx]
-            }
-        }
-        let rms = sqrt(sumSquares / Float(count))
-        
-        if rms < silenceThreshold {
-            if !inSilence {
-                inSilence = true
-                silenceStartFrame = frameIndex
-            }
-        } else {
-            if inSilence {
-                let silenceFrames = frameIndex - silenceStartFrame
-                let silenceDuration = Double(silenceFrames) / sampleRate
-                if silenceDuration >= minSilenceDuration {
-                    silenceIntervals.append((startFrame: silenceStartFrame, endFrame: frameIndex))
-                }
-                inSilence = false
-            }
-        }
-        frameIndex += framesPerMs
-    }
-    
-    if inSilence {
-        let silenceFrames = totalFrames - silenceStartFrame
-        let silenceDuration = Double(silenceFrames) / sampleRate
-        if silenceDuration >= minSilenceDuration {
-            silenceIntervals.append((startFrame: silenceStartFrame, endFrame: totalFrames))
-        }
+    // Fonction de conversion
+    func rmsToDB(_ rms: Float) -> Float {
+        return 20 * log10(rms + 1e-9)
     }
     
     var nonSilentSegments = [CMTimeRange]()
-    var lastEnd = 0
-    for interval in silenceIntervals {
-        if interval.startFrame > lastEnd {
-            let startSec = Double(lastEnd) / sampleRate
-            let endSec = Double(interval.startFrame) / sampleRate
-            let startCM = CMTime(seconds: startSec, preferredTimescale: timeScale)
-            let endCM   = CMTime(seconds: endSec, preferredTimescale: timeScale)
+    var currentSoundStart: Int? = nil
+    let startTimeLocal = Date()
+    var frameIndex = 0
+    var iteration = 0
+    
+    while frameIndex < totalFrames {
+        if iteration % 100 == 0 {
+            let progress = Double(frameIndex) / Double(totalFrames) * 100
+            let elapsed = Date().timeIntervalSince(startTimeLocal)
+            let remainingTime = (Double(totalFrames - frameIndex) / Double(frameIndex + 1)) * elapsed
+            DispatchQueue.main.async {
+                progressUpdate(String(format: "Analyse segments : %.1f%%, temps restant ≈ %.1f s", progress, remainingTime))
+            }
+        }
+        let windowEnd = min(frameIndex + framesPerMs, totalFrames)
+        let blockSampleCount = (windowEnd - frameIndex) * Int(channels)
+        let startIndex = frameIndex * Int(channels)
+        var blockRMS: Float = 0
+        if blockSampleCount > 0 {
+            vDSP_rmsqv(Array(samples[startIndex..<startIndex+blockSampleCount]), 1, &blockRMS, vDSP_Length(blockSampleCount))
+        }
+        let blockdB = rmsToDB(blockRMS)
+        // Si le niveau est supérieur ou égal au seuil, ce bloc est considéré comme du son.
+        if blockdB >= silenceThresholddB {
+            if currentSoundStart == nil {
+                currentSoundStart = frameIndex
+            }
+        } else {
+            // Bloc silencieux, si nous étions dans un segment sonore, terminons-le.
+            if let startSound = currentSoundStart {
+                let segmentStartSec = Double(startSound) / sampleRate
+                let segmentEndSec = Double(frameIndex) / sampleRate
+                if (segmentEndSec - segmentStartSec) >= minSilenceDuration {
+                    let startCM = CMTime(seconds: segmentStartSec, preferredTimescale: timeScale)
+                    let endCM = CMTime(seconds: segmentEndSec, preferredTimescale: timeScale)
+                    nonSilentSegments.append(CMTimeRange(start: startCM, end: endCM))
+                }
+                currentSoundStart = nil
+            }
+        }
+        frameIndex += framesPerMs
+        iteration += 1
+    }
+    
+    // Si la fin du fichier est sonore, on ferme le segment.
+    if let startSound = currentSoundStart {
+        let segmentStartSec = Double(startSound) / sampleRate
+        let segmentEndSec = Double(totalFrames) / sampleRate
+        if (segmentEndSec - segmentStartSec) >= minSilenceDuration {
+            let startCM = CMTime(seconds: segmentStartSec, preferredTimescale: timeScale)
+            let endCM = CMTime(seconds: segmentEndSec, preferredTimescale: timeScale)
             nonSilentSegments.append(CMTimeRange(start: startCM, end: endCM))
         }
-        lastEnd = interval.endFrame
-    }
-    if lastEnd < totalFrames {
-        let startSec = Double(lastEnd) / sampleRate
-        let endSec = Double(totalFrames) / sampleRate
-        let startCM = CMTime(seconds: startSec, preferredTimescale: timeScale)
-        let endCM = CMTime(seconds: endSec, preferredTimescale: timeScale)
-        nonSilentSegments.append(CMTimeRange(start: startCM, end: endCM))
     }
     
     DispatchQueue.main.async {
-        progressUpdate("Analyse audio terminée.")
+        progressUpdate("Analyse segments terminée.")
     }
     return nonSilentSegments
-}
-
-// Fonction auxiliaire (non utilisée si l'audio est déjà chargé)
-func detectNonSilentSegmentsInRAM(for asset: AVAsset,
-                                  thresholdPercentage: Float,
-                                  minSilenceDuration: Double,
-                                  progressUpdate: @escaping (String) -> Void) -> [CMTimeRange] {
-    guard let result = loadAudioSamples(from: asset, progressUpdate: progressUpdate) else {
-        return []
-    }
-    return detectNonSilentSegmentsFromSamples(samples: result.samples,
-                                              sampleRate: result.sampleRate,
-                                              channels: result.channels,
-                                              thresholdPercentage: thresholdPercentage,
-                                              minSilenceDuration: minSilenceDuration,
-                                              progressUpdate: progressUpdate)
 }
 
 // MARK: - Vue principale
 struct ContentView: View {
     @State private var videoURL: URL? = nil
     @State private var destinationDirectory: URL? = nil
-    @State private var threshold: Float = 1.0        // Seuil par défaut 1%
+    
+    // Maintenant, le seuil de silence est exprimé directement en dB (par exemple -40 dB)
+    @State private var silenceThresholddB: Float = -80.0
     @State private var minSilenceDuration: Double = 0.5
+    
     @State private var processing: Bool = false
     @State private var log: String = ""
     @State private var progressStatus: String = ""
+    
+    // On conserve ici le max dB pré-calculé (pour l'affichage)
+    @State private var precomputedMaxRMSLinear: Float?
+    @State private var precomputedMaxdB: Float?
+    @State private var maxRMSProgress: String = ""
     
     @State private var nonSilentSegments: [CMTimeRange] = []
     @State private var processedComposition: AVMutableComposition? = nil
@@ -390,9 +419,10 @@ struct ContentView: View {
             }
             .padding(.bottom)
             
+            // Ici, on utilise un seuil en dB pour la détection du silence.
             HStack {
-                Text("Seuil (%) : \(String(format: "%.1f", threshold))")
-                Slider(value: $threshold, in: 1...100, step: 0.5)
+                Text("Seuil silence (dB) : \(String(format: "%.1f", silenceThresholddB))")
+                Slider(value: $silenceThresholddB, in: -80...0, step: 1)
             }
             .padding(.bottom)
             
@@ -401,6 +431,14 @@ struct ContentView: View {
                 Slider(value: $minSilenceDuration, in: 0.1...2.0, step: 0.1)
             }
             .padding(.bottom)
+            
+            if let maxdB = precomputedMaxdB {
+                Text("Max dB: \(String(format: "%.4f", maxdB))")
+                    .foregroundColor(.blue)
+            }
+            Text(maxRMSProgress)
+                .foregroundColor(.blue)
+                .padding(.bottom)
             
             if !progressStatus.isEmpty {
                 Text(progressStatus)
@@ -491,16 +529,32 @@ struct ContentView: View {
                 let asset = AVAsset(url: url)
                 DispatchQueue.global(qos: .userInitiated).async {
                     if let result = loadAudioSamples(from: asset, progressUpdate: { update in
-                        DispatchQueue.main.async {
-                            progressStatus = update
-                        }
+                        DispatchQueue.main.async { progressStatus = update }
                     }) {
                         DispatchQueue.main.async {
-                            self.audioSamples = result.samples
+                            // Normalisation uniquement si nécessaire (les échantillons seront dans [-1,1])
+                            self.audioSamples = normalizeSamples(result.samples)
                             self.sampleRate = result.sampleRate
                             self.audioTimeScale = result.timeScale
                             log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels)).\n"
                         }
+                        // Calcul du max RMS avec progression pour affichage.
+                        computeMaxRMSWithProgress(
+                            samples: self.audioSamples,
+                            sampleRate: result.sampleRate,
+                            channels: result.channels,
+                            progressUpdate: { progress in
+                                DispatchQueue.main.async { self.maxRMSProgress = progress }
+                            },
+                            completion: { rawMaxRMS in
+                                DispatchQueue.main.async {
+                                    self.precomputedMaxRMSLinear = rawMaxRMS
+                                    let dBValue = 20 * log10(rawMaxRMS + 1e-9)
+                                    self.precomputedMaxdB = dBValue
+                                    self.maxRMSProgress = "Détection max dB terminée."
+                                }
+                            }
+                        )
                     }
                 }
             }
@@ -522,16 +576,30 @@ struct ContentView: View {
                             let asset = AVAsset(url: url)
                             DispatchQueue.global(qos: .userInitiated).async {
                                 if let result = loadAudioSamples(from: asset, progressUpdate: { update in
-                                    DispatchQueue.main.async {
-                                        progressStatus = update
-                                    }
+                                    DispatchQueue.main.async { progressStatus = update }
                                 }) {
                                     DispatchQueue.main.async {
-                                        self.audioSamples = result.samples
+                                        self.audioSamples = normalizeSamples(result.samples)
                                         self.sampleRate = result.sampleRate
                                         self.audioTimeScale = result.timeScale
                                         log += "Audio chargé en RAM (\(self.audioSamples.count) échantillons, rate=\(self.sampleRate), channels=\(result.channels)).\n"
                                     }
+                                    computeMaxRMSWithProgress(
+                                        samples: self.audioSamples,
+                                        sampleRate: result.sampleRate,
+                                        channels: result.channels,
+                                        progressUpdate: { progress in
+                                            DispatchQueue.main.async { self.maxRMSProgress = progress }
+                                        },
+                                        completion: { rawMaxRMS in
+                                            DispatchQueue.main.async {
+                                                self.precomputedMaxRMSLinear = rawMaxRMS
+                                                let dBValue = 20 * log10(rawMaxRMS + 1e-9)
+                                                self.precomputedMaxdB = dBValue
+                                                self.maxRMSProgress = "Détection max dB terminée."
+                                            }
+                                        }
+                                    )
                                 }
                             }
                         }
@@ -566,6 +634,7 @@ struct ContentView: View {
             log += "Audio non chargé. Veuillez importer la vidéo.\n"
             return
         }
+        let maxRMSValue = precomputedMaxRMSLinear ?? computeMaxRMS(samples: audioSamples, sampleRate: sampleRate, channels: 2)
         
         processing = true
         log = "Début du traitement...\n"
@@ -573,16 +642,15 @@ struct ContentView: View {
         
         let asset = AVAsset(url: videoURL)
         DispatchQueue.global(qos: .userInitiated).async {
+            // Utilisation du seuil en dB pour détecter les segments non silencieux.
             let segments = detectNonSilentSegmentsFromSamples(
                 samples: self.audioSamples,
                 sampleRate: self.sampleRate,
-                channels: 2,  // À ajuster selon le nombre de canaux
-                thresholdPercentage: self.threshold,
+                channels: 2,
+                silenceThresholddB: self.silenceThresholddB,
                 minSilenceDuration: self.minSilenceDuration,
                 progressUpdate: { update in
-                    DispatchQueue.main.async {
-                        progressStatus = update
-                    }
+                    DispatchQueue.main.async { progressStatus = update }
                 }
             )
             DispatchQueue.main.async {
@@ -618,8 +686,8 @@ struct ContentView: View {
                 let videoRange = videoTrack.timeRange
                 let audioRange = audioTrack.timeRange
                 let commonStart = max(videoRange.start, audioRange.start)
-                let commonEnd = min(videoRange.start + videoRange.duration,
-                                    audioRange.start + audioRange.duration)
+                let commonEnd = min(videoTrack.timeRange.start + videoTrack.timeRange.duration,
+                                    audioTrack.timeRange.start + audioTrack.timeRange.duration)
                 let intersectionRange = CMTimeRange(start: commonStart, end: commonEnd)
                 
                 var start = originalSegment.start
