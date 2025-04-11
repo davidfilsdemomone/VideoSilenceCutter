@@ -422,7 +422,7 @@ struct ContentView: View {
             // Ici, on utilise un seuil en dB pour la détection du silence.
             HStack {
                 Text("Seuil silence (dB) : \(String(format: "%.1f", silenceThresholddB))")
-                Slider(value: $silenceThresholddB, in: -80...0, step: 1)
+                Slider(value: $silenceThresholddB, in: -120...0, step: 1)
             }
             .padding(.bottom)
             
